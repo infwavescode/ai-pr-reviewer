@@ -1866,7 +1866,7 @@ ${filename}: ${summary}
 `;
             }
             // ask chatgpt to summarize the summaries
-            const [summarizeResp] = await heavyBot.chat(prompts.renderSummarizeChangesets(inputs), {});
+            const [summarizeResp] = await lightBot.chat(prompts.renderSummarizeChangesets(inputs), {});
             if (summarizeResp === '') {
                 (0, core_1.warning)('summarize: nothing obtained from openai');
             }
@@ -1898,7 +1898,7 @@ ${filename}: ${summary}
         }
     }
     // generate a short summary as well
-    const [summarizeShortResponse] = await heavyBot.chat(prompts.renderSummarizeShort(inputs), {});
+    const [summarizeShortResponse] = await lightBot.chat(prompts.renderSummarizeShort(inputs), {});
     inputs.shortSummary = summarizeShortResponse;
     let summarizeComment = `${summarizeFinalResponse}
 ${commenter_1.RAW_SUMMARY_START_TAG}
