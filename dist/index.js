@@ -943,7 +943,7 @@ class TokenLimits {
     requestTokens;
     responseTokens;
     knowledgeCutOff;
-    constructor(model = 'gpt-3.5-turbo') {
+    constructor(model = 'openai/gpt-5.3-codex') {
         void model;
         this.knowledgeCutOff = 'provider-specific';
         // Modern frontier models typically support far larger contexts than this
@@ -1033,7 +1033,7 @@ class Options {
     heavyTokenLimits;
     apiBaseUrl;
     language;
-    constructor(debug, disableReview, disableReleaseNotes, maxFiles = '0', reviewSimpleChanges = false, reviewCommentLGTM = false, pathFilters = null, systemMessage = '', openaiLightModel = 'gpt-3.5-turbo', openaiHeavyModel = 'gpt-3.5-turbo', openaiModelTemperature = '0.0', openaiRetries = '3', openaiTimeoutMS = '120000', openaiConcurrencyLimit = '6', githubConcurrencyLimit = '6', apiBaseUrl = 'https://api.openai.com/v1', language = 'en-US') {
+    constructor(debug, disableReview, disableReleaseNotes, maxFiles = '0', reviewSimpleChanges = false, reviewCommentLGTM = false, pathFilters = null, systemMessage = '', openaiLightModel = 'qwen/qwen3-coder-next', openaiHeavyModel = 'openai/gpt-5.3-codex', openaiModelTemperature = '0.0', openaiRetries = '3', openaiTimeoutMS = '120000', openaiConcurrencyLimit = '6', githubConcurrencyLimit = '6', apiBaseUrl = 'https://api.openai.com/v1', language = 'en-US') {
         this.debug = debug;
         this.disableReview = disableReview;
         this.disableReleaseNotes = disableReleaseNotes;
@@ -1128,7 +1128,7 @@ exports.PathFilter = PathFilter;
 class OpenAIOptions {
     model;
     tokenLimits;
-    constructor(model = 'gpt-3.5-turbo', tokenLimits = null) {
+    constructor(model = 'openai/gpt-5.3-codex', tokenLimits = null) {
         this.model = model;
         if (tokenLimits != null) {
             this.tokenLimits = tokenLimits;
@@ -1250,20 +1250,33 @@ $short_summary
 Input: New hunks annotated with line numbers and old hunks (replaced code). Hunks represent incomplete code fragments.
 Additional Context: PR title, description, summaries and comment chains.
 Task: Review new hunks for substantive issues using provided context and respond with comments if necessary.
-Output: Review comments in markdown with exact line number ranges in new hunks. Start and end line numbers must be within the same hunk. For single-line comments, start=end line number. Must use example response format below.
-Use fenced code blocks using the relevant language identifier where applicable.
-Don't annotate code snippets with line numbers. Format and indent code correctly.
-Do not use \`suggestion\` code blocks.
-For fixes, use \`diff\` code blocks, marking changes with \`+\` or \`-\`. The line number range for comments with fix snippets must exactly match the range to replace in the new hunk.
+Output: You MUST respond with valid JSON only. Do not wrap the JSON in markdown fences. Do not add preamble or trailing commentary.
+Use this schema exactly:
+{
+  "reviews": [
+    {
+      "start_line": 22,
+      "end_line": 22,
+      "comment": "Explain the issue and include a diff code block if helpful."
+    }
+  ]
+}
+
+Rules:
+- \`start_line\` and \`end_line\` must be integers and must refer to lines in the new hunk.
+- For single-line comments, \`start_line\` must equal \`end_line\`.
+- If there are no issues, return: \`{"reviews":[]}\`
+- Use fenced code blocks using the relevant language identifier where applicable.
+- Don't annotate code snippets with line numbers. Format and indent code correctly.
+- Do not use \`suggestion\` code blocks.
+- For fixes, use \`diff\` code blocks, marking changes with \`+\` or \`-\`.
+- The line number range for comments with fix snippets must exactly match the range to replace in the new hunk.
 
 - Do NOT provide general feedback, summaries, explanations of changes, or praises 
   for making good additions. 
 - Focus solely on offering specific, objective insights based on the 
   given context and refrain from making broad comments about potential impacts on 
   the system or question intentions behind the changes.
-
-If there are no issues found on a line range, you MUST respond with the 
-text \`LGTM!\` for that line range in the review section. 
 
 ## Example
 
@@ -1306,16 +1319,15 @@ Please review this change.
 
 ### Example response
 
-22-22:
-There's a syntax error in the add function.
-\`\`\`diff
--    retrn z
-+    return z
-\`\`\`
----
-24-25:
-LGTM!
----
+{
+  "reviews": [
+    {
+      "start_line": 22,
+      "end_line": 22,
+      "comment": "There's a syntax error in the add function.\\n\`\`\`diff\\n-    retrn z\\n+    return z\\n\`\`\`"
+    }
+  ]
+}
 
 ## Changes made to \`$filename\` for your review
 
@@ -1569,7 +1581,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.codeReview = void 0;
+exports.parseReview = exports.codeReview = void 0;
 const core_1 = __nccwpck_require__(2186);
 // eslint-disable-next-line camelcase
 const github_1 = __nccwpck_require__(5438);
@@ -1934,9 +1946,10 @@ ${summariesFailed.length > 0
             const needsReview = summaries.find(([summaryFilename]) => summaryFilename === filename)?.[2] ?? true;
             return needsReview;
         });
-        const reviewsSkipped = filesAndChanges
+        const reviewsSkippedTrivial = filesAndChanges
             .filter(([filename]) => !filesAndChangesReview.some(([reviewFilename]) => reviewFilename === filename))
             .map(([filename]) => filename);
+        const reviewsSkippedTooLarge = [];
         // failed reviews array
         const reviewsFailed = [];
         let lgtmCount = 0;
@@ -2022,9 +2035,7 @@ ${commentChain}
                     const reviews = parseReview(response, patches, options.debug);
                     for (const review of reviews) {
                         // check for LGTM
-                        if (!options.reviewCommentLGTM &&
-                            (review.comment.includes('LGTM') ||
-                                review.comment.includes('looks good to me'))) {
+                        if (isLGTMComment(review.comment) && !options.reviewCommentLGTM) {
                             lgtmCount += 1;
                             continue;
                         }
@@ -2047,7 +2058,7 @@ ${commentChain}
                 }
             }
             else {
-                reviewsSkipped.push(`${filename} (diff too large)`);
+                reviewsSkippedTooLarge.push(`${filename} (diff too large)`);
             }
         };
         const reviewPromises = [];
@@ -2072,11 +2083,20 @@ ${reviewsFailed.length > 0
 </details>
 `
             : ''}
-${reviewsSkipped.length > 0
+${reviewsSkippedTrivial.length > 0
             ? `<details>
-<summary>Files skipped from review due to trivial changes (${reviewsSkipped.length})</summary>
+<summary>Files skipped from review due to trivial changes (${reviewsSkippedTrivial.length})</summary>
 
-* ${reviewsSkipped.join('\n* ')}
+* ${reviewsSkippedTrivial.join('\n* ')}
+
+</details>
+`
+            : ''}
+${reviewsSkippedTooLarge.length > 0
+            ? `<details>
+<summary>Files not reviewed because diff was too large (${reviewsSkippedTooLarge.length})</summary>
+
+* ${reviewsSkippedTooLarge.join('\n* ')}
 
 </details>
 `
@@ -2207,6 +2227,62 @@ const parsePatch = (patch) => {
     };
 };
 function parseReview(response, patches, debug = false) {
+    const structuredReviews = parseStructuredReview(response, patches, debug);
+    if (structuredReviews.length > 0) {
+        return structuredReviews;
+    }
+    return parseLegacyReview(response, patches, debug);
+}
+exports.parseReview = parseReview;
+function parseStructuredReview(response, patches, debug = false) {
+    const sanitized = sanitizeStructuredResponse(response);
+    if (sanitized === '') {
+        return [];
+    }
+    try {
+        const parsed = JSON.parse(sanitized);
+        const rawReviews = Array.isArray(parsed)
+            ? parsed
+            : Array.isArray(parsed.reviews)
+                ? parsed.reviews
+                : [];
+        if (rawReviews.length === 0) {
+            return [];
+        }
+        const reviews = [];
+        for (const rawReview of rawReviews) {
+            if (rawReview == null ||
+                typeof rawReview !== 'object' ||
+                Array.isArray(rawReview)) {
+                continue;
+            }
+            const record = rawReview;
+            const startLine = readInteger(record, ['start_line', 'startLine', 'line']);
+            const endLine = readInteger(record, ['end_line', 'endLine']) ?? startLine;
+            const comment = typeof record.comment === 'string' ? record.comment : '';
+            if (startLine == null ||
+                endLine == null ||
+                startLine <= 0 ||
+                endLine < startLine ||
+                comment.trim() === '') {
+                continue;
+            }
+            reviews.push(remapReviewToPatch({
+                startLine,
+                endLine,
+                comment: sanitizeCommentBody(comment)
+            }, patches, debug));
+        }
+        return reviews;
+    }
+    catch (e) {
+        if (debug) {
+            (0, core_1.info)(`Failed to parse structured review JSON, falling back: ${e}`);
+        }
+        return [];
+    }
+}
+function parseLegacyReview(response, patches, debug = false) {
     const reviews = [];
     response = sanitizeResponse(response.trim());
     const lines = response.split('\n');
@@ -2217,75 +2293,14 @@ function parseReview(response, patches, debug = false) {
     let currentComment = '';
     function storeReview() {
         if (currentStartLine !== null && currentEndLine !== null) {
-            const review = {
+            const review = remapReviewToPatch({
                 startLine: currentStartLine,
                 endLine: currentEndLine,
-                comment: currentComment
-            };
-            let withinPatch = false;
-            let bestPatchStartLine = -1;
-            let bestPatchEndLine = -1;
-            let maxIntersection = 0;
-            for (const [startLine, endLine] of patches) {
-                const intersectionStart = Math.max(review.startLine, startLine);
-                const intersectionEnd = Math.min(review.endLine, endLine);
-                const intersectionLength = Math.max(0, intersectionEnd - intersectionStart + 1);
-                if (intersectionLength > maxIntersection) {
-                    maxIntersection = intersectionLength;
-                    bestPatchStartLine = startLine;
-                    bestPatchEndLine = endLine;
-                    withinPatch =
-                        intersectionLength === review.endLine - review.startLine + 1;
-                }
-                if (withinPatch)
-                    break;
-            }
-            if (!withinPatch) {
-                if (bestPatchStartLine !== -1 && bestPatchEndLine !== -1) {
-                    review.comment = `> Note: This review was outside of the patch, so it was mapped to the patch with the greatest overlap. Original lines [${review.startLine}-${review.endLine}]
-
-${review.comment}`;
-                    review.startLine = bestPatchStartLine;
-                    review.endLine = bestPatchEndLine;
-                }
-                else {
-                    review.comment = `> Note: This review was outside of the patch, but no patch was found that overlapped with it. Original lines [${review.startLine}-${review.endLine}]
-
-${review.comment}`;
-                    review.startLine = patches[0][0];
-                    review.endLine = patches[0][1];
-                }
-            }
+                comment: sanitizeCommentBody(currentComment)
+            }, patches, debug);
             reviews.push(review);
             (0, core_1.info)(`Stored comment for line range ${currentStartLine}-${currentEndLine}: ${currentComment.trim()}`);
         }
-    }
-    function sanitizeCodeBlock(comment, codeBlockLabel) {
-        const codeBlockStart = `\`\`\`${codeBlockLabel}`;
-        const codeBlockEnd = '```';
-        const lineNumberRegex = /^ *(\d+): /gm;
-        let codeBlockStartIndex = comment.indexOf(codeBlockStart);
-        while (codeBlockStartIndex !== -1) {
-            const codeBlockEndIndex = comment.indexOf(codeBlockEnd, codeBlockStartIndex + codeBlockStart.length);
-            if (codeBlockEndIndex === -1)
-                break;
-            const codeBlock = comment.substring(codeBlockStartIndex + codeBlockStart.length, codeBlockEndIndex);
-            const sanitizedBlock = codeBlock.replace(lineNumberRegex, '');
-            comment =
-                comment.slice(0, codeBlockStartIndex + codeBlockStart.length) +
-                    sanitizedBlock +
-                    comment.slice(codeBlockEndIndex);
-            codeBlockStartIndex = comment.indexOf(codeBlockStart, codeBlockStartIndex +
-                codeBlockStart.length +
-                sanitizedBlock.length +
-                codeBlockEnd.length);
-        }
-        return comment;
-    }
-    function sanitizeResponse(comment) {
-        comment = sanitizeCodeBlock(comment, 'suggestion');
-        comment = sanitizeCodeBlock(comment, 'diff');
-        return comment;
     }
     for (const line of lines) {
         const lineNumberRangeMatch = line.match(lineNumberRangeRegex);
@@ -2315,6 +2330,107 @@ ${review.comment}`;
     }
     storeReview();
     return reviews;
+}
+function remapReviewToPatch(review, patches, debug = false) {
+    let withinPatch = false;
+    let bestPatchStartLine = -1;
+    let bestPatchEndLine = -1;
+    let maxIntersection = 0;
+    for (const [startLine, endLine] of patches) {
+        const intersectionStart = Math.max(review.startLine, startLine);
+        const intersectionEnd = Math.min(review.endLine, endLine);
+        const intersectionLength = Math.max(0, intersectionEnd - intersectionStart + 1);
+        if (intersectionLength > maxIntersection) {
+            maxIntersection = intersectionLength;
+            bestPatchStartLine = startLine;
+            bestPatchEndLine = endLine;
+            withinPatch =
+                intersectionLength === review.endLine - review.startLine + 1;
+        }
+        if (withinPatch)
+            break;
+    }
+    if (!withinPatch) {
+        if (bestPatchStartLine !== -1 && bestPatchEndLine !== -1) {
+            review.comment = `> Note: This review was outside of the patch, so it was mapped to the patch with the greatest overlap. Original lines [${review.startLine}-${review.endLine}]
+
+${review.comment}`;
+            review.startLine = bestPatchStartLine;
+            review.endLine = bestPatchEndLine;
+        }
+        else {
+            review.comment = `> Note: This review was outside of the patch, but no patch was found that overlapped with it. Original lines [${review.startLine}-${review.endLine}]
+
+${review.comment}`;
+            review.startLine = patches[0][0];
+            review.endLine = patches[0][1];
+        }
+    }
+    if (debug) {
+        (0, core_1.info)(`Remapped review to line range ${review.startLine}-${review.endLine}`);
+    }
+    return review;
+}
+function sanitizeCodeBlock(comment, codeBlockLabel) {
+    const codeBlockStart = `\`\`\`${codeBlockLabel}`;
+    const codeBlockEnd = '```';
+    const lineNumberRegex = /^ *(\d+): /gm;
+    let codeBlockStartIndex = comment.indexOf(codeBlockStart);
+    while (codeBlockStartIndex !== -1) {
+        const codeBlockEndIndex = comment.indexOf(codeBlockEnd, codeBlockStartIndex + codeBlockStart.length);
+        if (codeBlockEndIndex === -1)
+            break;
+        const codeBlock = comment.substring(codeBlockStartIndex + codeBlockStart.length, codeBlockEndIndex);
+        const sanitizedBlock = codeBlock.replace(lineNumberRegex, '');
+        comment =
+            comment.slice(0, codeBlockStartIndex + codeBlockStart.length) +
+                sanitizedBlock +
+                comment.slice(codeBlockEndIndex);
+        codeBlockStartIndex = comment.indexOf(codeBlockStart, codeBlockStartIndex +
+            codeBlockStart.length +
+            sanitizedBlock.length +
+            codeBlockEnd.length);
+    }
+    return comment;
+}
+function sanitizeResponse(comment) {
+    comment = sanitizeCodeBlock(comment, 'suggestion');
+    comment = sanitizeCodeBlock(comment, 'diff');
+    return comment;
+}
+function sanitizeStructuredResponse(response) {
+    const trimmed = response.trim();
+    if (trimmed === '') {
+        return '';
+    }
+    const fencedJson = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+    if (fencedJson != null) {
+        return fencedJson[1].trim();
+    }
+    const firstBrace = trimmed.search(/[\[{]/);
+    if (firstBrace > 0) {
+        return trimmed.slice(firstBrace).trim();
+    }
+    return trimmed;
+}
+function sanitizeCommentBody(comment) {
+    return sanitizeResponse(comment.trim());
+}
+function readInteger(record, keys) {
+    for (const key of keys) {
+        const value = record[key];
+        if (typeof value === 'number' && Number.isInteger(value)) {
+            return value;
+        }
+        if (typeof value === 'string' && /^\d+$/.test(value.trim())) {
+            return parseInt(value.trim(), 10);
+        }
+    }
+    return null;
+}
+function isLGTMComment(comment) {
+    const normalized = comment.trim().toLowerCase();
+    return normalized === 'lgtm!' || normalized === 'lgtm' || normalized.includes('looks good to me');
 }
 
 

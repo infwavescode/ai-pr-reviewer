@@ -400,7 +400,7 @@ ${filename}: ${summary}
 `
       }
       // ask chatgpt to summarize the summaries
-      const [summarizeResp] = await heavyBot.chat(
+      const [summarizeResp] = await lightBot.chat(
         prompts.renderSummarizeChangesets(inputs),
         {}
       )
@@ -444,7 +444,7 @@ ${filename}: ${summary}
   }
 
   // generate a short summary as well
-  const [summarizeShortResponse] = await heavyBot.chat(
+  const [summarizeShortResponse] = await lightBot.chat(
     prompts.renderSummarizeShort(inputs),
     {}
   )

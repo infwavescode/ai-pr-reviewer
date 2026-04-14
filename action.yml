@@ -143,7 +143,7 @@ inputs:
   disable_release_notes:
     required: false
     description: 'Disable release notes'
-    default: 'false'
+    default: 'true'
   openai_base_url:
     required: false
     description: 'The url of the openai api interface.'
