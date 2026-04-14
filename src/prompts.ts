@@ -104,20 +104,33 @@ $short_summary
 Input: New hunks annotated with line numbers and old hunks (replaced code). Hunks represent incomplete code fragments.
 Additional Context: PR title, description, summaries and comment chains.
 Task: Review new hunks for substantive issues using provided context and respond with comments if necessary.
-Output: Review comments in markdown with exact line number ranges in new hunks. Start and end line numbers must be within the same hunk. For single-line comments, start=end line number. Must use example response format below.
-Use fenced code blocks using the relevant language identifier where applicable.
-Don't annotate code snippets with line numbers. Format and indent code correctly.
-Do not use \`suggestion\` code blocks.
-For fixes, use \`diff\` code blocks, marking changes with \`+\` or \`-\`. The line number range for comments with fix snippets must exactly match the range to replace in the new hunk.
+Output: You MUST respond with valid JSON only. Do not wrap the JSON in markdown fences. Do not add preamble or trailing commentary.
+Use this schema exactly:
+{
+  "reviews": [
+    {
+      "start_line": 22,
+      "end_line": 22,
+      "comment": "Explain the issue and include a diff code block if helpful."
+    }
+  ]
+}
+
+Rules:
+- \`start_line\` and \`end_line\` must be integers and must refer to lines in the new hunk.
+- For single-line comments, \`start_line\` must equal \`end_line\`.
+- If there are no issues, return: \`{"reviews":[]}\`
+- Use fenced code blocks using the relevant language identifier where applicable.
+- Don't annotate code snippets with line numbers. Format and indent code correctly.
+- Do not use \`suggestion\` code blocks.
+- For fixes, use \`diff\` code blocks, marking changes with \`+\` or \`-\`.
+- The line number range for comments with fix snippets must exactly match the range to replace in the new hunk.
 
 - Do NOT provide general feedback, summaries, explanations of changes, or praises 
   for making good additions. 
 - Focus solely on offering specific, objective insights based on the 
   given context and refrain from making broad comments about potential impacts on 
   the system or question intentions behind the changes.
-
-If there are no issues found on a line range, you MUST respond with the 
-text \`LGTM!\` for that line range in the review section. 
 
 ## Example
 
@@ -160,16 +173,15 @@ Please review this change.
 
 ### Example response
 
-22-22:
-There's a syntax error in the add function.
-\`\`\`diff
--    retrn z
-+    return z
-\`\`\`
----
-24-25:
-LGTM!
----
+{
+  "reviews": [
+    {
+      "start_line": 22,
+      "end_line": 22,
+      "comment": "There's a syntax error in the add function.\\n\`\`\`diff\\n-    retrn z\\n+    return z\\n\`\`\`"
+    }
+  ]
+}
 
 ## Changes made to \`$filename\` for your review
 

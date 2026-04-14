@@ -510,7 +510,7 @@ ${
       return needsReview
     })
 
-    const reviewsSkipped = filesAndChanges
+    const reviewsSkippedTrivial = filesAndChanges
       .filter(
         ([filename]) =>
           !filesAndChangesReview.some(
@@ -518,6 +518,7 @@ ${
           )
       )
       .map(([filename]) => filename)
+    const reviewsSkippedTooLarge: string[] = []
 
     // failed reviews array
     const reviewsFailed: string[] = []
@@ -632,11 +633,7 @@ ${commentChain}
           const reviews = parseReview(response, patches, options.debug)
           for (const review of reviews) {
             // check for LGTM
-            if (
-              !options.reviewCommentLGTM &&
-              (review.comment.includes('LGTM') ||
-                review.comment.includes('looks good to me'))
-            ) {
+            if (isLGTMComment(review.comment) && !options.reviewCommentLGTM) {
               lgtmCount += 1
               continue
             }
@@ -666,7 +663,7 @@ ${commentChain}
           reviewsFailed.push(`${filename} (${e as string})`)
         }
       } else {
-        reviewsSkipped.push(`${filename} (diff too large)`)
+        reviewsSkippedTooLarge.push(`${filename} (diff too large)`)
       }
     }
 
@@ -698,13 +695,26 @@ ${
     : ''
 }
 ${
-  reviewsSkipped.length > 0
+  reviewsSkippedTrivial.length > 0
     ? `<details>
 <summary>Files skipped from review due to trivial changes (${
-        reviewsSkipped.length
+        reviewsSkippedTrivial.length
       })</summary>
 
-* ${reviewsSkipped.join('\n* ')}
+* ${reviewsSkippedTrivial.join('\n* ')}
+
+</details>
+`
+    : ''
+}
+${
+  reviewsSkippedTooLarge.length > 0
+    ? `<details>
+<summary>Files not reviewed because diff was too large (${
+        reviewsSkippedTooLarge.length
+      })</summary>
+
+* ${reviewsSkippedTooLarge.join('\n* ')}
 
 </details>
 `
@@ -862,13 +872,97 @@ const parsePatch = (
   }
 }
 
-interface Review {
+export interface Review {
   startLine: number
   endLine: number
   comment: string
 }
 
-function parseReview(
+export function parseReview(
+  response: string,
+  patches: Array<[number, number, string]>,
+  debug = false
+): Review[] {
+  const structuredReviews = parseStructuredReview(response, patches, debug)
+  if (structuredReviews.length > 0) {
+    return structuredReviews
+  }
+  return parseLegacyReview(response, patches, debug)
+}
+
+function parseStructuredReview(
+  response: string,
+  patches: Array<[number, number, string]>,
+  debug = false
+): Review[] {
+  const sanitized = sanitizeStructuredResponse(response)
+  if (sanitized === '') {
+    return []
+  }
+
+  try {
+    const parsed = JSON.parse(sanitized) as
+      | {reviews?: unknown}
+      | Array<unknown>
+    const rawReviews = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray(parsed.reviews)
+        ? parsed.reviews
+        : []
+
+    if (rawReviews.length === 0) {
+      return []
+    }
+
+    const reviews: Review[] = []
+    for (const rawReview of rawReviews) {
+      if (
+        rawReview == null ||
+        typeof rawReview !== 'object' ||
+        Array.isArray(rawReview)
+      ) {
+        continue
+      }
+
+      const record = rawReview as Record<string, unknown>
+      const startLine = readInteger(record, ['start_line', 'startLine', 'line'])
+      const endLine =
+        readInteger(record, ['end_line', 'endLine']) ?? startLine
+      const comment = typeof record.comment === 'string' ? record.comment : ''
+
+      if (
+        startLine == null ||
+        endLine == null ||
+        startLine <= 0 ||
+        endLine < startLine ||
+        comment.trim() === ''
+      ) {
+        continue
+      }
+
+      reviews.push(
+        remapReviewToPatch(
+          {
+            startLine,
+            endLine,
+            comment: sanitizeCommentBody(comment)
+          },
+          patches,
+          debug
+        )
+      )
+    }
+
+    return reviews
+  } catch (e: unknown) {
+    if (debug) {
+      info(`Failed to parse structured review JSON, falling back: ${e}`)
+    }
+    return []
+  }
+}
+
+function parseLegacyReview(
   response: string,
   patches: Array<[number, number, string]>,
   debug = false
@@ -886,51 +980,15 @@ function parseReview(
   let currentComment = ''
   function storeReview(): void {
     if (currentStartLine !== null && currentEndLine !== null) {
-      const review: Review = {
-        startLine: currentStartLine,
-        endLine: currentEndLine,
-        comment: currentComment
-      }
-
-      let withinPatch = false
-      let bestPatchStartLine = -1
-      let bestPatchEndLine = -1
-      let maxIntersection = 0
-
-      for (const [startLine, endLine] of patches) {
-        const intersectionStart = Math.max(review.startLine, startLine)
-        const intersectionEnd = Math.min(review.endLine, endLine)
-        const intersectionLength = Math.max(
-          0,
-          intersectionEnd - intersectionStart + 1
-        )
-
-        if (intersectionLength > maxIntersection) {
-          maxIntersection = intersectionLength
-          bestPatchStartLine = startLine
-          bestPatchEndLine = endLine
-          withinPatch =
-            intersectionLength === review.endLine - review.startLine + 1
-        }
-
-        if (withinPatch) break
-      }
-
-      if (!withinPatch) {
-        if (bestPatchStartLine !== -1 && bestPatchEndLine !== -1) {
-          review.comment = `> Note: This review was outside of the patch, so it was mapped to the patch with the greatest overlap. Original lines [${review.startLine}-${review.endLine}]
-
-${review.comment}`
-          review.startLine = bestPatchStartLine
-          review.endLine = bestPatchEndLine
-        } else {
-          review.comment = `> Note: This review was outside of the patch, but no patch was found that overlapped with it. Original lines [${review.startLine}-${review.endLine}]
-
-${review.comment}`
-          review.startLine = patches[0][0]
-          review.endLine = patches[0][1]
-        }
-      }
+      const review = remapReviewToPatch(
+        {
+          startLine: currentStartLine,
+          endLine: currentEndLine,
+          comment: sanitizeCommentBody(currentComment)
+        },
+        patches,
+        debug
+      )
 
       reviews.push(review)
 
@@ -938,50 +996,6 @@ ${review.comment}`
         `Stored comment for line range ${currentStartLine}-${currentEndLine}: ${currentComment.trim()}`
       )
     }
-  }
-
-  function sanitizeCodeBlock(comment: string, codeBlockLabel: string): string {
-    const codeBlockStart = `\`\`\`${codeBlockLabel}`
-    const codeBlockEnd = '```'
-    const lineNumberRegex = /^ *(\d+): /gm
-
-    let codeBlockStartIndex = comment.indexOf(codeBlockStart)
-
-    while (codeBlockStartIndex !== -1) {
-      const codeBlockEndIndex = comment.indexOf(
-        codeBlockEnd,
-        codeBlockStartIndex + codeBlockStart.length
-      )
-
-      if (codeBlockEndIndex === -1) break
-
-      const codeBlock = comment.substring(
-        codeBlockStartIndex + codeBlockStart.length,
-        codeBlockEndIndex
-      )
-      const sanitizedBlock = codeBlock.replace(lineNumberRegex, '')
-
-      comment =
-        comment.slice(0, codeBlockStartIndex + codeBlockStart.length) +
-        sanitizedBlock +
-        comment.slice(codeBlockEndIndex)
-
-      codeBlockStartIndex = comment.indexOf(
-        codeBlockStart,
-        codeBlockStartIndex +
-          codeBlockStart.length +
-          sanitizedBlock.length +
-          codeBlockEnd.length
-      )
-    }
-
-    return comment
-  }
-
-  function sanitizeResponse(comment: string): string {
-    comment = sanitizeCodeBlock(comment, 'suggestion')
-    comment = sanitizeCodeBlock(comment, 'diff')
-    return comment
   }
 
   for (const line of lines) {
@@ -1017,4 +1031,146 @@ ${review.comment}`
   storeReview()
 
   return reviews
+}
+
+function remapReviewToPatch(
+  review: Review,
+  patches: Array<[number, number, string]>,
+  debug = false
+): Review {
+  let withinPatch = false
+  let bestPatchStartLine = -1
+  let bestPatchEndLine = -1
+  let maxIntersection = 0
+
+  for (const [startLine, endLine] of patches) {
+    const intersectionStart = Math.max(review.startLine, startLine)
+    const intersectionEnd = Math.min(review.endLine, endLine)
+    const intersectionLength = Math.max(
+      0,
+      intersectionEnd - intersectionStart + 1
+    )
+
+    if (intersectionLength > maxIntersection) {
+      maxIntersection = intersectionLength
+      bestPatchStartLine = startLine
+      bestPatchEndLine = endLine
+      withinPatch =
+        intersectionLength === review.endLine - review.startLine + 1
+    }
+
+    if (withinPatch) break
+  }
+
+  if (!withinPatch) {
+    if (bestPatchStartLine !== -1 && bestPatchEndLine !== -1) {
+      review.comment = `> Note: This review was outside of the patch, so it was mapped to the patch with the greatest overlap. Original lines [${review.startLine}-${review.endLine}]
+
+${review.comment}`
+      review.startLine = bestPatchStartLine
+      review.endLine = bestPatchEndLine
+    } else {
+      review.comment = `> Note: This review was outside of the patch, but no patch was found that overlapped with it. Original lines [${review.startLine}-${review.endLine}]
+
+${review.comment}`
+      review.startLine = patches[0][0]
+      review.endLine = patches[0][1]
+    }
+  }
+
+  if (debug) {
+    info(
+      `Remapped review to line range ${review.startLine}-${review.endLine}`
+    )
+  }
+
+  return review
+}
+
+function sanitizeCodeBlock(comment: string, codeBlockLabel: string): string {
+  const codeBlockStart = `\`\`\`${codeBlockLabel}`
+  const codeBlockEnd = '```'
+  const lineNumberRegex = /^ *(\d+): /gm
+
+  let codeBlockStartIndex = comment.indexOf(codeBlockStart)
+
+  while (codeBlockStartIndex !== -1) {
+    const codeBlockEndIndex = comment.indexOf(
+      codeBlockEnd,
+      codeBlockStartIndex + codeBlockStart.length
+    )
+
+    if (codeBlockEndIndex === -1) break
+
+    const codeBlock = comment.substring(
+      codeBlockStartIndex + codeBlockStart.length,
+      codeBlockEndIndex
+    )
+    const sanitizedBlock = codeBlock.replace(lineNumberRegex, '')
+
+    comment =
+      comment.slice(0, codeBlockStartIndex + codeBlockStart.length) +
+      sanitizedBlock +
+      comment.slice(codeBlockEndIndex)
+
+    codeBlockStartIndex = comment.indexOf(
+      codeBlockStart,
+      codeBlockStartIndex +
+        codeBlockStart.length +
+        sanitizedBlock.length +
+        codeBlockEnd.length
+    )
+  }
+
+  return comment
+}
+
+function sanitizeResponse(comment: string): string {
+  comment = sanitizeCodeBlock(comment, 'suggestion')
+  comment = sanitizeCodeBlock(comment, 'diff')
+  return comment
+}
+
+function sanitizeStructuredResponse(response: string): string {
+  const trimmed = response.trim()
+  if (trimmed === '') {
+    return ''
+  }
+
+  const fencedJson = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)
+  if (fencedJson != null) {
+    return fencedJson[1].trim()
+  }
+
+  const firstBrace = trimmed.search(/[\[{]/)
+  if (firstBrace > 0) {
+    return trimmed.slice(firstBrace).trim()
+  }
+
+  return trimmed
+}
+
+function sanitizeCommentBody(comment: string): string {
+  return sanitizeResponse(comment.trim())
+}
+
+function readInteger(
+  record: Record<string, unknown>,
+  keys: string[]
+): number | null {
+  for (const key of keys) {
+    const value = record[key]
+    if (typeof value === 'number' && Number.isInteger(value)) {
+      return value
+    }
+    if (typeof value === 'string' && /^\d+$/.test(value.trim())) {
+      return parseInt(value.trim(), 10)
+    }
+  }
+  return null
+}
+
+function isLGTMComment(comment: string): boolean {
+  const normalized = comment.trim().toLowerCase()
+  return normalized === 'lgtm!' || normalized === 'lgtm' || normalized.includes('looks good to me')
 }
